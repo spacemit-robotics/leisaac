@@ -19,8 +19,15 @@ except ImportError:
         ImportWarning,
     )
 
-from .gr00t import serialization
-from .openpi import msgpack_numpy
+try:
+    from .gr00t import serialization
+except ImportError:
+    serialization = None
+
+try:
+    from .openpi import msgpack_numpy
+except ImportError:
+    msgpack_numpy = None
 
 
 class Policy(ABC):
@@ -87,6 +94,12 @@ class ZMQServicePolicy(Policy):
             data: The input data for the endpoint.
             requires_input: Whether the endpoint requires input data.
         """
+        if serialization is None:
+            raise ImportError(
+                "GR00T serialization dependencies are not installed. "
+                "Please install the GR00T extras to use ZMQServicePolicy."
+            )
+
         request: dict = {"endpoint": endpoint}
         if requires_input:
             request["data"] = data
@@ -106,6 +119,11 @@ class ZMQServicePolicy(Policy):
 class WebsocketServicePolicy(Policy):
     def __init__(self, host: str, port: int | None = None, timeout_ms: int = 5000, api_key: str | None = None):
         super().__init__("service")
+        if msgpack_numpy is None:
+            raise ImportError(
+                "OpenPI websocket dependencies are not installed. "
+                "Please install the OpenPI extras to use WebsocketServicePolicy."
+            )
         self._uri = f"ws://{host}"
         if port is not None:
             self._uri += f":{port}"

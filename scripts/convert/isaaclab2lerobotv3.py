@@ -135,65 +135,72 @@ def add_episode(
 
 def convert_isaaclab_to_lerobot():
     """automatically build features and dataset"""
-    env_cfg = parse_env_cfg(args_cli.task_name, device=args_cli.device, num_envs=1)
-    task_type = get_task_type(args_cli.task_name, args_cli.task_type)
-    env_cfg.use_teleop_device(task_type)
+    env = None
+    dataset = None
+    try:
+        env_cfg = parse_env_cfg(args_cli.task_name, device=args_cli.device, num_envs=1)
+        task_type = get_task_type(args_cli.task_name, args_cli.task_type)
+        env_cfg.use_teleop_device(task_type)
 
-    env: ManagerBasedRLEnv | DirectRLEnv = gym.make(args_cli.task_name, cfg=env_cfg).unwrapped
+        env = gym.make(args_cli.task_name, cfg=env_cfg).unwrapped
 
-    dataset_cfg = LeRobotDatasetCfg(
-        repo_id=args_cli.repo_id,
-        fps=args_cli.fps,
-        robot_type=env_cfg.robot_name,
-    )
-    dataset_cfg.features = build_feature_from_env(env, dataset_cfg)
+        dataset_cfg = LeRobotDatasetCfg(
+            repo_id=args_cli.repo_id,
+            fps=args_cli.fps,
+            robot_type=env_cfg.robot_name,
+        )
+        dataset_cfg.features = build_feature_from_env(env, dataset_cfg)
 
-    dataset = LeRobotDataset.create(
-        repo_id=dataset_cfg.repo_id,
-        fps=dataset_cfg.fps,
-        robot_type=dataset_cfg.robot_type,
-        features=dataset_cfg.features,
-    )
+        dataset = LeRobotDataset.create(
+            repo_id=dataset_cfg.repo_id,
+            fps=dataset_cfg.fps,
+            robot_type=dataset_cfg.robot_type,
+            features=dataset_cfg.features,
+        )
 
-    if args_cli.hdf5_files is None:
-        hdf5_files_list = [os.path.join(args_cli.hdf5_root, "dataset.hdf5")]
-    else:
-        hdf5_files_list = [
-            os.path.join(args_cli.hdf5_root, f.strip()) if not os.path.isabs(f.strip()) else f.strip()
-            for f in args_cli.hdf5_files.split(",")
-        ]
+        if args_cli.hdf5_files is None:
+            hdf5_files_list = [os.path.join(args_cli.hdf5_root, "dataset.hdf5")]
+        else:
+            hdf5_files_list = [
+                os.path.join(args_cli.hdf5_root, f.strip()) if not os.path.isabs(f.strip()) else f.strip()
+                for f in args_cli.hdf5_files.split(",")
+            ]
 
-    now_episode_index = 0
-    for hdf5_id, hdf5_file in enumerate(hdf5_files_list):
-        print(f"[{hdf5_id+1}/{len(hdf5_files_list)}] Processing hdf5 file: {hdf5_file}")
+        now_episode_index = 0
+        for hdf5_id, hdf5_file in enumerate(hdf5_files_list):
+            print(f"[{hdf5_id+1}/{len(hdf5_files_list)}] Processing hdf5 file: {hdf5_file}")
 
-        dataset_file_handler = HDF5DatasetFileHandler()
-        dataset_file_handler.open(hdf5_file)
+            dataset_file_handler = HDF5DatasetFileHandler()
+            try:
+                dataset_file_handler.open(hdf5_file)
 
-        episode_names = dataset_file_handler.get_episode_names()
-        print(f"Found {len(episode_names)} episodes: {episode_names}")
-        for episode_name in tqdm(episode_names, desc="Processing each episode"):
-            episode = dataset_file_handler.load_episode(episode_name, device=args_cli.device)
-            if not episode.success:
-                print(f"Episode {episode_name} is not successful, skip it")
-                continue
-            valid = add_episode(dataset, episode, env, dataset_cfg, args_cli.task_description)
-            if valid:
-                now_episode_index += 1
-                dataset.save_episode()
-                print(f"Saving episode {now_episode_index} successfully")
-            else:
-                dataset.clear_episode_buffer()
+                episode_names = dataset_file_handler.get_episode_names()
+                print(f"Found {len(episode_names)} episodes: {episode_names}")
+                for episode_name in tqdm(episode_names, desc="Processing each episode"):
+                    episode = dataset_file_handler.load_episode(episode_name, device=args_cli.device)
+                    if not episode.success:
+                        print(f"Episode {episode_name} is not successful, skip it")
+                        continue
+                    valid = add_episode(dataset, episode, env, dataset_cfg, args_cli.task_description)
+                    if valid:
+                        now_episode_index += 1
+                        dataset.save_episode()
+                        print(f"Saving episode {now_episode_index} successfully")
+                    else:
+                        dataset.clear_episode_buffer()
+            finally:
+                dataset_file_handler.close()
 
-        dataset_file_handler.close()
+        dataset.finalize()
 
-    dataset.finalize()
+        if args_cli.push_to_hub:
+            dataset.push_to_hub()
 
-    if args_cli.push_to_hub:
-        dataset.push_to_hub()
-
-    print("Finished converting IsaacLab dataset to LeRobot dataset")
-    env.close()
+        print("Finished converting IsaacLab dataset to LeRobot dataset")
+    finally:
+        if env is not None:
+            env.close()
+        simulation_app.close()
 
 
 if __name__ == "__main__":

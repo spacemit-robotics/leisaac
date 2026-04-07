@@ -3,6 +3,13 @@ from enum import Enum
 
 import torch
 
+# Compatibility with lerobot.async_inference server pickle protocol.
+# The remote server unpickles incoming config/observation objects and checks
+# against classes imported from lerobot.async_inference.helpers. Expose the
+# LeIsaac-side equivalents under the same module path so cross-process pickle
+# identity matches without requiring IsaacLab on the inference machine.
+_LEROBOT_ASYNC_HELPERS_MODULE = "lerobot.async_inference.helpers"
+
 
 class FeatureType(str, Enum):
     STATE = "STATE"
@@ -18,6 +25,9 @@ class PolicyFeature:
     shape: tuple
 
 
+PolicyFeature.__module__ = _LEROBOT_ASYNC_HELPERS_MODULE
+
+
 @dataclass
 class RemotePolicyConfig:
     policy_type: str
@@ -25,6 +35,9 @@ class RemotePolicyConfig:
     lerobot_features: dict[str, PolicyFeature]
     actions_per_chunk: int
     device: str = "cpu"
+
+
+RemotePolicyConfig.__module__ = _LEROBOT_ASYNC_HELPERS_MODULE
 
 
 RawObservation = dict[str, torch.Tensor]
@@ -60,9 +73,15 @@ class TimedObservation(TimedData):
         return self.observation
 
 
+TimedObservation.__module__ = _LEROBOT_ASYNC_HELPERS_MODULE
+
+
 @dataclass
 class TimedAction(TimedData):
     action: Action
 
     def get_action(self):
         return self.action
+
+
+TimedAction.__module__ = _LEROBOT_ASYNC_HELPERS_MODULE

@@ -123,7 +123,8 @@ class Controller:
 
 def preprocess_obs_dict(obs_dict: dict, model_type: str, language_instruction: str):
     """Preprocess the observation dictionary to the format expected by the policy."""
-    if model_type in ["gr00tn1.5", "gr00tn1.6", "lerobot", "openpi"]:
+    lerobot_model_types = {"act", "smolvla", "diffusion", "tdmpc", "vqbet", "pi0", "pi05"}
+    if model_type in ["gr00tn1.5", "gr00tn1.6", "lerobot", "openpi"] or model_type in lerobot_model_types:
         obs_dict["task_description"] = language_instruction
         return obs_dict
     else:
@@ -148,6 +149,11 @@ def main():
 
     # create environment
     env: ManagerBasedRLEnv = gym.make(args_cli.task, cfg=env_cfg).unwrapped
+    policy_language_instruction = args_cli.policy_language_instruction or getattr(
+        env_cfg,
+        "task_description",
+        "",
+    )
 
     # create policy
     model_type = args_cli.policy_type
@@ -238,7 +244,7 @@ def main():
                     episode_count += 1
                     break
 
-                obs_dict = preprocess_obs_dict(obs_dict["policy"], model_type, args_cli.policy_language_instruction)
+                obs_dict = preprocess_obs_dict(obs_dict["policy"], model_type, policy_language_instruction)
                 actions = policy.get_action(obs_dict).to(env.device)
                 for i in range(min(args_cli.policy_action_horizon, actions.shape[0])):
                     action = actions[i, :, :]

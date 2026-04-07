@@ -1,0 +1,337 @@
+# Copyright (c) 2022-2025, The Isaac Lab Project Developers.
+# All rights reserved.
+#
+# SPDX-License-Identifier: BSD-3-Clause
+
+"""Script to run network-based teleoperation with leisaac manipulation environments.
+
+This is a standalone script for remote teleoperation via network. It connects to a
+leader_sender.py TCP server running on the local PC and streams joint states to Isaac Sim.
+
+Usage (on remote server):
+    python scripts/environments/teleoperation/teleop_network.py \
+        --task LeIsaac-SO101-PickCube-v0 \
+        --leader-host 10.0.91.83 --leader-port 5050 \
+        --record --enable_cameras \
+        --dataset_file ./datasets/dataset.hdf5
+
+On local PC (first):
+    python scripts/tools/leader_sender.py --port /dev/ttyACM0 --listen-port 5050
+"""
+
+"""Launch Isaac Sim Simulator first."""
+import multiprocessing
+
+if multiprocessing.get_start_method() != "spawn":
+    multiprocessing.set_start_method("spawn", force=True)
+import argparse
+import signal
+
+from isaaclab.app import AppLauncher
+
+# add argparse arguments
+parser = argparse.ArgumentParser(description="Network-based teleoperation for leisaac environments.")
+parser.add_argument("--num_envs", type=int, default=1, help="Number of environments to simulate.")
+parser.add_argument("--task", type=str, default=None, help="Name of the task.")
+parser.add_argument("--seed", type=int, default=None, help="Seed for the environment.")
+
+# network leader args
+parser.add_argument("--leader-host", type=str, default="10.0.91.83",
+                    help="IP of the local PC running leader_sender.py")
+parser.add_argument("--leader-port", type=int, default=5050,
+                    help="TCP port of leader_sender.py (default: 5050)")
+
+# recorder_parameter
+parser.add_argument("--record", action="store_true", help="whether to enable record function")
+parser.add_argument("--step_hz", type=int, default=60, help="Environment stepping rate in Hz.")
+parser.add_argument(
+    "--dataset_file", type=str, default="./datasets/dataset.hdf5", help="File path to export recorded demos."
+)
+parser.add_argument("--resume", action="store_true", help="whether to resume recording in the existing dataset file")
+parser.add_argument(
+    "--num_demos", type=int, default=0, help="Number of demonstrations to record. Set to 0 for infinite."
+)
+
+parser.add_argument("--quality", action="store_true", help="whether to enable quality render mode.")
+parser.add_argument("--use_lerobot_recorder", action="store_true", help="whether to use lerobot recorder.")
+parser.add_argument("--lerobot_dataset_repo_id", type=str, default=None, help="Lerobot Dataset repository ID.")
+parser.add_argument("--lerobot_dataset_fps", type=int, default=30, help="Lerobot Dataset frames per second.")
+
+# append AppLauncher cli args
+AppLauncher.add_app_launcher_args(parser)
+# parse the arguments
+args_cli = parser.parse_args()
+
+app_launcher_args = vars(args_cli)
+
+# launch omniverse app
+app_launcher = AppLauncher(app_launcher_args)
+simulation_app = app_launcher.app
+
+import os
+import time
+
+import gymnasium as gym
+import torch
+from isaaclab.envs import DirectRLEnv, ManagerBasedRLEnv
+from isaaclab.managers import DatasetExportMode, TerminationTermCfg
+from isaaclab_tasks.utils import parse_env_cfg
+from leisaac.enhance.managers import EnhanceDatasetExportMode, StreamingRecorderManager
+from leisaac.utils.env_utils import dynamic_reset_gripper_effort_limit_sim
+
+
+class RateLimiter:
+    """Convenience class for enforcing rates in loops."""
+
+    def __init__(self, hz):
+        """
+        Args:
+            hz (int): frequency to enforce
+        """
+        self.hz = hz
+        self.last_time = time.time()
+        self.sleep_duration = 1.0 / hz
+        self.render_period = min(0.0166, self.sleep_duration)
+
+    def sleep(self, env):
+        """Attempt to sleep at the specified rate in hz."""
+        next_wakeup_time = self.last_time + self.sleep_duration
+        while time.time() < next_wakeup_time:
+            time.sleep(self.render_period)
+            env.sim.render()
+
+        self.last_time = self.last_time + self.sleep_duration
+
+        # detect time jumping forwards (e.g. loop is too slow)
+        if self.last_time < time.time():
+            while self.last_time < time.time():
+                self.last_time += self.sleep_duration
+
+
+def manual_terminate(env: ManagerBasedRLEnv | DirectRLEnv, success: bool):
+    if hasattr(env, "termination_manager"):
+        if success:
+            env.termination_manager.set_term_cfg(
+                "success",
+                TerminationTermCfg(func=lambda env: torch.ones(env.num_envs, dtype=torch.bool, device=env.device)),
+            )
+        else:
+            env.termination_manager.set_term_cfg(
+                "success",
+                TerminationTermCfg(func=lambda env: torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)),
+            )
+        env.termination_manager.compute()
+    elif hasattr(env, "_get_dones"):
+        env.cfg.return_success_status = success
+
+
+def main():  # noqa: C901
+    """Running network-based teleoperation with leisaac manipulation environment."""
+
+    # get directory path and file name (without extension) from cli arguments
+    output_dir = os.path.dirname(args_cli.dataset_file)
+    output_file_name = os.path.splitext(os.path.basename(args_cli.dataset_file))[0]
+    # create directory if it does not exist
+    if not os.path.exists(output_dir):
+        os.makedirs(output_dir)
+
+    env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=args_cli.num_envs)
+    # Use "so101leader" for env config — same action space as local SO101Leader
+    env_cfg.use_teleop_device("so101leader")
+    env_cfg.seed = args_cli.seed if args_cli.seed is not None else int(time.time())
+    task_name = args_cli.task
+
+    if args_cli.quality:
+        env_cfg.sim.render.antialiasing_mode = "FXAA"
+        env_cfg.sim.render.rendering_mode = "quality"
+
+    is_direct_env = "Direct" in task_name
+
+    # timeout and terminate preprocess
+    if is_direct_env:
+        env_cfg.never_time_out = True
+        env_cfg.manual_terminate = True
+    else:
+        # modify configuration
+        if hasattr(env_cfg.terminations, "time_out"):
+            env_cfg.terminations.time_out = None
+        if hasattr(env_cfg.terminations, "success"):
+            env_cfg.terminations.success = None
+    # recorder preprocess & manual success terminate preprocess
+    if args_cli.record:
+        if args_cli.use_lerobot_recorder:
+            if args_cli.resume:
+                env_cfg.recorders.dataset_export_mode = EnhanceDatasetExportMode.EXPORT_SUCCEEDED_ONLY_RESUME
+            else:
+                env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_SUCCEEDED_ONLY
+        else:
+            if args_cli.resume:
+                env_cfg.recorders.dataset_export_mode = EnhanceDatasetExportMode.EXPORT_ALL_RESUME
+                assert os.path.exists(
+                    args_cli.dataset_file
+                ), "the dataset file does not exist, please don't use '--resume' if you want to record a new dataset"
+            else:
+                env_cfg.recorders.dataset_export_mode = DatasetExportMode.EXPORT_ALL
+                assert not os.path.exists(
+                    args_cli.dataset_file
+                ), "the dataset file already exists, please use '--resume' to resume recording"
+        env_cfg.recorders.dataset_export_dir_path = output_dir
+        env_cfg.recorders.dataset_filename = output_file_name
+        if is_direct_env:
+            env_cfg.return_success_status = False
+        else:
+            if not hasattr(env_cfg.terminations, "success"):
+                setattr(env_cfg.terminations, "success", None)
+            env_cfg.terminations.success = TerminationTermCfg(
+                func=lambda env: torch.zeros(env.num_envs, dtype=torch.bool, device=env.device)
+            )
+    else:
+        env_cfg.recorders = None
+
+    # create environment
+    env: ManagerBasedRLEnv | DirectRLEnv = gym.make(task_name, cfg=env_cfg).unwrapped
+    # replace the original recorder manager with the streaming recorder manager or lerobot recorder manager
+    if args_cli.record:
+        del env.recorder_manager
+        if args_cli.use_lerobot_recorder:
+            from leisaac.enhance.datasets.lerobot_dataset_handler import (
+                LeRobotDatasetCfg,
+            )
+            from leisaac.enhance.managers.lerobot_recorder_manager import (
+                LeRobotRecorderManager,
+            )
+
+            dataset_cfg = LeRobotDatasetCfg(
+                repo_id=args_cli.lerobot_dataset_repo_id,
+                fps=args_cli.lerobot_dataset_fps,
+            )
+            env.recorder_manager = LeRobotRecorderManager(env_cfg.recorders, dataset_cfg, env)
+        else:
+            env.recorder_manager = StreamingRecorderManager(env_cfg.recorders, env)
+            env.recorder_manager.flush_steps = 100
+            env.recorder_manager.compression = "lzf"
+
+    # create network-based SO101 leader controller
+    from leisaac.devices import NetworkSO101Leader
+
+    teleop_interface = NetworkSO101Leader(env, host=args_cli.leader_host, port=args_cli.leader_port)
+
+    # add teleoperation key for env reset
+    should_reset_recording_instance = False
+
+    def reset_recording_instance():
+        nonlocal should_reset_recording_instance
+        should_reset_recording_instance = True
+
+    # add teleoperation key for task success
+    should_reset_task_success = False
+
+    def reset_task_success():
+        nonlocal should_reset_task_success
+        should_reset_task_success = True
+        reset_recording_instance()
+
+    teleop_interface.add_callback("R", reset_recording_instance)
+    teleop_interface.add_callback("N", reset_task_success)
+    teleop_interface.display_controls()
+    rate_limiter = RateLimiter(args_cli.step_hz)
+
+    # reset environment
+    if hasattr(env, "initialize"):
+        env.initialize()
+    env.reset()
+    teleop_interface.reset()
+
+    resume_recorded_demo_count = 0
+    if args_cli.record and args_cli.resume:
+        resume_recorded_demo_count = env.recorder_manager._dataset_file_handler.get_num_episodes()
+        print(f"Resume recording from existing dataset file with {resume_recorded_demo_count} demonstrations.")
+    current_recorded_demo_count = resume_recorded_demo_count
+
+    start_record_state = False
+
+    interrupted = False
+
+    def signal_handler(signum, frame):
+        """Handle SIGINT (Ctrl+C) signal."""
+        nonlocal interrupted
+        interrupted = True
+        print("\n[INFO] KeyboardInterrupt (Ctrl+C) detected. Cleaning up resources...")
+
+    original_sigint_handler = signal.signal(signal.SIGINT, signal_handler)
+
+    try:
+        while simulation_app.is_running() and not interrupted:
+            # run everything in inference mode
+            with torch.inference_mode():
+                if env.cfg.dynamic_reset_gripper_effort_limit:
+                    dynamic_reset_gripper_effort_limit_sim(env, "so101leader")
+                actions = teleop_interface.advance()
+                if should_reset_task_success:
+                    print("Task Success!!!")
+                    should_reset_task_success = False
+                    if args_cli.record:
+                        manual_terminate(env, True)
+                if should_reset_recording_instance:
+                    env.reset()
+                    should_reset_recording_instance = False
+                    if start_record_state:
+                        if args_cli.record:
+                            print("Stop Recording!!!")
+                        start_record_state = False
+                    if args_cli.record:
+                        manual_terminate(env, False)
+                    # print out the current demo count if it has changed
+                    if (
+                        args_cli.record
+                        and env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count
+                        > current_recorded_demo_count
+                    ):
+                        current_recorded_demo_count = (
+                            env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count
+                        )
+                        print(f"Recorded {current_recorded_demo_count} successful demonstrations.")
+                    if (
+                        args_cli.record
+                        and args_cli.num_demos > 0
+                        and env.recorder_manager.exported_successful_episode_count + resume_recorded_demo_count
+                        >= args_cli.num_demos
+                    ):
+                        print(f"All {args_cli.num_demos} demonstrations recorded. Exiting the app.")
+                        break
+
+                elif actions is None:
+                    env.render()
+                # apply actions
+                else:
+                    if not start_record_state:
+                        if args_cli.record:
+                            print("Start Recording!!!")
+                        start_record_state = True
+                    env.step(actions)
+                if rate_limiter:
+                    rate_limiter.sleep(env)
+            if interrupted:
+                break
+    except Exception as e:
+        import traceback
+
+        print(f"\n[ERROR] An error occurred: {e}\n")
+        traceback.print_exc()
+        print("[INFO] Cleaning up resources...")
+    finally:
+        # Restore original signal handler
+        signal.signal(signal.SIGINT, original_sigint_handler)
+        # finalize the recorder manager
+        if args_cli.record and hasattr(env.recorder_manager, "finalize"):
+            env.recorder_manager.finalize()
+        # disconnect network leader
+        teleop_interface.disconnect()
+        # close the simulator
+        env.close()
+        simulation_app.close()
+
+
+if __name__ == "__main__":
+    # run the main function
+    main()

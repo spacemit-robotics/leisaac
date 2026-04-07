@@ -11,10 +11,16 @@ from leisaac.utils.robot_utils import (
 )
 
 from .base import Policy, WebsocketServicePolicy, ZMQServicePolicy
-from .lerobot.helpers import RemotePolicyConfig, TimedObservation
 from .lerobot.transport import services_pb2, services_pb2_grpc
 from .lerobot.transport.utils import grpc_channel_options, send_bytes_in_chunks
 from .openpi import image_tools
+
+try:
+    # Use the exact classes from external LeRobot async server to avoid pickle class-identity mismatch.
+    from lerobot.async_inference.helpers import RemotePolicyConfig, TimedObservation
+except Exception:
+    # Fallback for environments that only have the local LeIsaac helpers.
+    from .lerobot.helpers import RemotePolicyConfig, TimedObservation
 
 
 class Gr00tServicePolicyClient(ZMQServicePolicy):
@@ -296,6 +302,7 @@ class LeRobotServicePolicyClient(Policy):
             timestamp=time.time(),
             observation=raw_observation,
             timestep=self.latest_action_step,
+            must_go=True,
         )
 
         # send observation to policy server
@@ -327,7 +334,7 @@ class LeRobotServicePolicyClient(Policy):
         concat_action = torch.cat(action_list, dim=0)
         concat_action = convert_lerobot_action_to_leisaac(concat_action)
 
-        self.last_action = concat_action[-1, :]
+        self.last_action = concat_action[-1, :].copy()
         self.skip_send_observation = False
 
         return torch.from_numpy(concat_action[:, None, :])
