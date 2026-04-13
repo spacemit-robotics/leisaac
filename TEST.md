@@ -13,23 +13,23 @@
 
 ## 系统架构
 
-LeIsaac 采用**仿真服务器 + 本地客户端**的分布式架构。各组件职责分工如下：
+LeIsaac 采用**仿真器 + 推理器**的分布式架构。各组件职责分工如下：
 
 | 组件 | 职责 | 部署位置 |
 |------|------|---------|
-| **仿真服务器** | Isaac Sim/Lab 环境管理；数据采集；评测执行；可选Lab训练 | NVIDIA GPU + CUDA 12.8 |
-| **本地客户端** | SO101 Leader 连接；关节状态采样；推理服务（gRPC） | PC 或边缘设备 |
+| **仿真器** | Isaac Sim/Lab 环境管理；数据采集；评测执行；可选Lab训练 | NVIDIA GPU + CUDA 12.8 |
+| **推理器** | SO101 Leader 连接；关节状态采样；推理服务（gRPC） | PC 或开发板 |
 
 **通信协议**：采用 gRPC 进行双向通信，支持客户端流式观测上传和单向动作下发。
 
 ## 环境配置
 
-### 服务器环境
+### 仿真环境
 
 #### 克隆仓库并初始化 Conda 环境
 
 ```bash
-git clone https://github.com/LightwheelAI/leisaac.git --recursive
+git clone git@github.com:spacemit-robotics/leisaac.git --recursive
 cd leisaac
 
 conda create -n leisaac python=3.11
@@ -58,7 +58,7 @@ cd ../..
 pip install -e source/leisaac
 
 # LeRobot，数据集转换需要
-pip install -e "source/leisaac[lerobot]"
+pip install lerobot==0.4.2
 pip install numpy==1.26.0
 ```
 
@@ -78,6 +78,8 @@ assets/
     └── custom_scene/
 ```
 
+如果已有场景满足需求，按照 [add custm task](https://lightwheelai.github.io/leisaac/docs/tutorials/custom_task) 添加一个客制化仿真场景。
+
 #### 环境验证
 
 ```bash
@@ -86,15 +88,23 @@ python scripts/environments/list_envs.py
 
 若顺利输出可用任务列表，表示服务器环境配置正确。
 
-### 本地环境
+### 推理环境
 
 本地需分别配置数据采集和分布式推理环境。
+
+#### 克隆仓库并初始化 Conda 环境
+
+```bash
+git clone git@github.com:spacemit-robotics/leisaac.git --recursive
+cd leisaac
+
+python -m venv local-venv
+source local-venv/bin/activate
+```
 
 #### 数据采集环境
 
 ```bash
-python -m venv local-venv
-source local-venv/bin/activate
 pip install pyserial deepdiff tqdm feetech-servo-sdk
 ```
 
@@ -102,15 +112,13 @@ pip install pyserial deepdiff tqdm feetech-servo-sdk
 
 ```bash
 sudo usermod -aG dialout $USER
-# 重新登录或执行 newgrp dialout
+# 重新登录或执行 newgrp dialout生效
 ```
 
 #### 分布式推理环境
 
 ```bash
-source local-venv/bin/activate
-
-pip install lerobot
+pip install "lerobot>=0.4.2"
 pip install grpcio grpcio-tools protobuf
 ```
 
@@ -230,7 +238,7 @@ LeIsaac 重点聚焦数据采集和推理评测。模型训练由外部框架承
 
 ```bash
 cd /path/to/lerobot
-conda activate lerobot
+conda activate leisaac
 
 lerobot-train \
   --policy.type=act \
@@ -279,8 +287,6 @@ outputs/train/act_test_custom_task/checkpoints/last/pretrained_model/
 ### 本地：启动推理服务
 
 ```bash
-source local-venv/bin/activate
-
 python -m lerobot.async_inference.policy_server \
     --host=0.0.0.0 \
     --port=5555
