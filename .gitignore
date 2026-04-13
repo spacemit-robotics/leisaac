@@ -10,6 +10,9 @@
 
 # Python
 .DS_Store
+.leisaac-env/
+**/.venv/
+**/venv/
 **/*.egg-info/
 **/__pycache__/
 **/.pytest_cache/
@@ -54,6 +57,7 @@ _build
 
 # Pre-Trained Checkpoints
 /.pretrained_checkpoints/
+/models/**/checkpoints/
 
 # Teleop Recorded Dataset
 /datasets/
