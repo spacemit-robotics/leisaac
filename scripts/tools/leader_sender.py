@@ -1,4 +1,4 @@
-sou #!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Local SO101 Leader Arm Network Sender
 
